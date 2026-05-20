@@ -2,6 +2,7 @@ import argparse
 import csv
 import html
 import json
+import logging
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Set
@@ -32,6 +33,9 @@ from main import (
 
 DETAIL_FIELD_PREFIX = "unit_detail_"
 BASIC_INFORMATION_FIELD_PREFIX = "unit_basic_"
+DEFAULT_LOG_FILE = "fazwaz_project_units.log"
+
+logger = logging.getLogger("fazwaz_project_units")
 
 DETAIL_FIELDS = [
     "unit_id",
@@ -46,6 +50,73 @@ DETAIL_FIELDS = [
     "unit_detail_images",
     "unit_basic_information",
 ]
+
+
+def setup_logging(log_file: str = DEFAULT_LOG_FILE) -> None:
+    logging.basicConfig(
+        filename=log_file,
+        filemode="w",
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def log_missing_unit_fields(
+    unit: Dict[str, Optional[str]],
+    context: str,
+    fields: Iterable[str],
+    unit_url: Optional[str] = None,
+    unit_id: Optional[str] = None,
+) -> None:
+    missing_fields = [field for field in fields if not unit.get(field)]
+
+    if missing_fields:
+        logged_unit_url = unit_url or unit.get("unit_url")
+        logged_unit_id = (
+            unit_id
+            or unit.get("unit_id")
+            or extract_unit_id(logged_unit_url)
+        )
+        logger.warning(
+            "%s missing fields: %s | unit_url=%s | unit_id=%s",
+            context,
+            ", ".join(missing_fields),
+            logged_unit_url,
+            logged_unit_id,
+        )
+
+
+def log_project_unit_summary(
+    project_url: str,
+    soup: BeautifulSoup,
+    units: List[Dict],
+    embedded_prices: Dict[str, Dict[str, str]],
+) -> None:
+    available_unit_nodes = soup.select(".available-units-table-list")
+
+    logger.info(
+        "Project unit summary | project_url=%s | unit_nodes=%s | parsed_units=%s | embedded_prices=%s",
+        project_url,
+        len(available_unit_nodes),
+        len(units),
+        len(embedded_prices),
+    )
+
+    if available_unit_nodes and not units:
+        logger.warning(
+            "Unit nodes were found but no units were parsed | project_url=%s",
+            project_url,
+        )
+
+    if not available_unit_nodes:
+        possible_sections = soup.select(
+            "[class*=available-unit], [class*=unit], [data-testid*=unit]"
+        )
+        logger.warning(
+            "No unit nodes found with selector .available-units-table-list | project_url=%s | possible_unit_like_nodes=%s",
+            project_url,
+            len(possible_sections),
+        )
 
 
 def normalize_field_name(value: str, prefix: str = DETAIL_FIELD_PREFIX) -> str:
@@ -249,6 +320,7 @@ def parse_json_ld_blocks(soup: BeautifulSoup) -> List[Dict]:
         try:
             data = json.loads(raw_json)
         except json.JSONDecodeError:
+            logger.warning("Invalid JSON-LD block skipped")
             continue
 
         if isinstance(data, list):
@@ -440,18 +512,40 @@ def parse_amenities(soup: BeautifulSoup) -> Dict[str, Optional[str]]:
 
 
 def parse_unit_detail_page(unit_url: str) -> Dict[str, Optional[str]]:
+    logger.info("Parsing unit detail page | unit_url=%s", unit_url)
     response = request_with_retry(unit_url)
 
     if not response:
+        logger.warning("Unit detail request failed | unit_url=%s", unit_url)
         return {}
 
     soup = BeautifulSoup(response.text, "html.parser")
     unit_id = extract_unit_id(unit_url)
+
+    if not unit_id:
+        logger.warning("Unit id was not extracted from URL | unit_url=%s", unit_url)
+
     thb_data = parse_embedded_unit_thb_data(response.text, unit_id)
+
+    if not thb_data:
+        logger.warning(
+            "Embedded THB data not found on unit detail page | unit_url=%s | unit_id=%s",
+            unit_url,
+            unit_id,
+        )
+
     rate_to_thb = get_page_currency_rate_to_thb(
         soup,
         thb_data.get("current_price"),
     )
+
+    if thb_data.get("current_price") and not rate_to_thb:
+        logger.warning(
+            "Currency rate to THB was not detected from page title/meta | unit_url=%s | unit_id=%s",
+            unit_url,
+            unit_id,
+        )
+
     canonical_tag = soup.select_one('link[rel="canonical"]')
     h1_tag = soup.find("h1")
 
@@ -495,8 +589,31 @@ def parse_unit_detail_page(unit_url: str) -> Dict[str, Optional[str]]:
     result.update(parse_basic_information_items(soup))
     result.update(parse_amenities(soup))
     result = normalize_detail_prices_to_thb(result, thb_data, rate_to_thb)
+    result = {key: value for key, value in result.items() if value}
 
-    return {key: value for key, value in result.items() if value}
+    log_missing_unit_fields(
+        result,
+        "Unit detail parsed with incomplete data",
+        [
+            "unit_id",
+            "unit_detail_title",
+            "unit_detail_h1",
+            "unit_detail_price",
+            "unit_basic_information",
+        ],
+        unit_url=unit_url,
+        unit_id=unit_id,
+    )
+
+    if len(result) <= 2:
+        logger.warning(
+            "Unit detail page produced very few fields | unit_url=%s | unit_id=%s | fields=%s",
+            unit_url,
+            unit_id,
+            sorted(result.keys()),
+        )
+
+    return result
 
 
 def parse_project_with_unit_pages(
@@ -506,6 +623,7 @@ def parse_project_with_unit_pages(
     response = request_with_retry(project_url)
 
     if not response:
+        logger.warning("Project request failed | project_url=%s", project_url)
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -513,12 +631,15 @@ def parse_project_with_unit_pages(
 
     if not project:
         print(f"[PARSE ERROR] Project data not found: {project_url}")
+        logger.warning("Project data not found | project_url=%s", project_url)
         return []
 
     embedded_prices = parse_embedded_unit_prices(response.text)
     units = parse_units(soup, embedded_prices)
+    log_project_unit_summary(project_url, soup, units, embedded_prices)
 
     if not units:
+        logger.warning("Project has no parsed units, writing project-only row | project_url=%s", project_url)
         return [project]
 
     rows: List[Dict] = []
@@ -530,8 +651,73 @@ def parse_project_with_unit_pages(
     for index, unit in enumerate(units, 1):
         unit_url = unit.get("unit_url")
         print(f"   [{index}/{total}] Unit: {unit_url or 'no url'}")
+        unit_id = extract_unit_id(unit_url)
 
-        unit_detail = parse_unit_detail_page(unit_url) if unit_url else {}
+        logger.info(
+            "Parsing project unit | project_url=%s | index=%s/%s | unit_url=%s | unit_id=%s",
+            project_url,
+            index,
+            total,
+            unit_url,
+            unit_id,
+        )
+
+        if not unit_url:
+            logger.warning(
+                "Unit skipped detail parsing because unit URL is missing | project_url=%s | index=%s",
+                project_url,
+                index,
+            )
+        elif not unit_id:
+            logger.warning(
+                "Unit URL does not contain extractable unit id | project_url=%s | index=%s | unit_url=%s",
+                project_url,
+                index,
+                unit_url,
+            )
+
+        if unit_id and unit_id not in embedded_prices:
+            logger.warning(
+                "Embedded listing price not found for unit | project_url=%s | index=%s | unit_url=%s | unit_id=%s",
+                project_url,
+                index,
+                unit_url,
+                unit_id,
+            )
+
+        log_missing_unit_fields(
+            unit,
+            "Project unit listing parsed with incomplete data",
+            [
+                "unit_url",
+                "unit_transaction",
+                "unit_price",
+                "unit_price_per_sqm",
+                "unit_beds",
+                "unit_baths",
+                "unit_size",
+            ],
+        )
+
+        try:
+            unit_detail = parse_unit_detail_page(unit_url) if unit_url else {}
+        except Exception:
+            logger.exception(
+                "Unit detail parsing crashed | project_url=%s | index=%s | unit_url=%s",
+                project_url,
+                index,
+                unit_url,
+            )
+            unit_detail = {}
+
+        if unit_url and not unit_detail:
+            logger.warning(
+                "Unit detail data is empty | project_url=%s | index=%s | unit_url=%s",
+                project_url,
+                index,
+                unit_url,
+            )
+
         rows.append(
             {
                 **project,
@@ -562,12 +748,14 @@ def get_project_links(area: str, page_limit: Optional[int] = None) -> List[str]:
         response = request_with_retry(url)
 
         if not response:
+            logger.warning("Directory page request failed | area=%s | page=%s | url=%s", area, page, url)
             break
 
         soup = BeautifulSoup(response.text, "html.parser")
         items = soup.find_all("a", class_="site-map-item-link")
 
         if not items:
+            logger.info("No project links found on directory page | area=%s | page=%s | url=%s", area, page, url)
             break
 
         page_links = []
@@ -611,6 +799,7 @@ def parse_area_with_unit_pages(
             print(f"   Rows added: {len(project_rows)}")
         else:
             print("   Skipped")
+            logger.warning("Project skipped without rows | project_url=%s", link)
 
         if index < total:
             sleep_jitter()
@@ -705,6 +894,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Read only the first N project-directory pages for the area.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=DEFAULT_LOG_FILE,
+        help=f"Diagnostic log file. Defaults to {DEFAULT_LOG_FILE}.",
+    )
 
     args = parser.parse_args()
 
@@ -719,7 +913,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    setup_logging(args.log_file)
     start_time = time.time()
+
+    logger.info("Parser started | args=%s", vars(args))
+    print(f"Log file: {args.log_file}")
 
     if args.area:
         print(f"Area: {args.area}")
@@ -737,6 +935,7 @@ def main() -> None:
 
     if not rows:
         print("No data parsed")
+        logger.warning("Parser finished without parsed rows")
         return
 
     write_csv(rows, output_file)
@@ -747,6 +946,12 @@ def main() -> None:
     print(f"File: {output_file}")
     print(f"Rows: {len(rows)}")
     print(f"Time: {elapsed} sec")
+    logger.info(
+        "Parser finished | output_file=%s | rows=%s | elapsed_sec=%s",
+        output_file,
+        len(rows),
+        elapsed,
+    )
 
 
 if __name__ == "__main__":
