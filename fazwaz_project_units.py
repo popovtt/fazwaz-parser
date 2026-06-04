@@ -198,6 +198,7 @@ def parse_embedded_unit_thb_data(
         r'"_id":"'
         + re.escape(unit_id)
         + r'".*?'
+        r'"abbr":"THB".*?'
         r'"current_price":"(?P<price>[\d.]+)".*?'
         r'"indoor_area":(?P<area>[\d.]+|null)',
         re.DOTALL,
@@ -249,38 +250,90 @@ def get_page_currency_rate_to_thb(
     return None
 
 
-def convert_uah_text_to_thb(value: str, rate_to_thb: Optional[float]) -> str:
-    if "₴" not in value or not rate_to_thb:
+def format_thb_monthly(value: float) -> str:
+    return format_thb_text(value, "/mo")
+
+
+def replace_title_price_with_thb(
+    value: Optional[str],
+    thb_price: Optional[str],
+) -> Optional[str]:
+    if not value or not thb_price:
         return value
 
-    def replace_match(match: re.Match) -> str:
-        amount = parse_price_number(match.group(1))
-
-        if amount is None:
-            return match.group(0)
-
-        suffix = match.group(2) or ""
-        return format_thb_text(amount * rate_to_thb, suffix)
-
     return re.sub(
-        r"(\d[\d,]*(?:\.\d+)?)₴((?:/SqM|/mo|/month)?)",
-        replace_match,
+        r"\bfor\s+\d[\d,]*(?:\.\d+)?\s*[^\w\s|]+",
+        f"for {thb_price}",
         value,
+        count=1,
     )
+
+
+def remove_non_thb_money_values(
+    values: Dict[str, Optional[str]],
+) -> Dict[str, Optional[str]]:
+    non_thb_symbols = ("₴", "$", "€", "£")
+    money_field_fragments = (
+        "price",
+        "fee",
+        "fund",
+        "amount",
+        "rent",
+        "rental",
+    )
+    normalized: Dict[str, Optional[str]] = {}
+
+    for key, value in values.items():
+        if key == "unit_basic_information" and isinstance(value, str):
+            parts = [
+                part.strip()
+                for part in value.split("|")
+                if not any(symbol in part for symbol in non_thb_symbols)
+            ]
+            normalized[key] = " | ".join(parts) if parts else None
+            continue
+
+        if (
+            isinstance(value, str)
+            and any(symbol in value for symbol in non_thb_symbols)
+            and any(fragment in key.lower() for fragment in money_field_fragments)
+        ):
+            normalized[key] = None
+            continue
+
+        normalized[key] = value
+
+    return normalized
+
+
+def parse_direct_thb_cam_fee(soup: BeautifulSoup) -> Optional[str]:
+    text = clean_text(soup.get_text(" ", strip=True)) or ""
+    patterns = [
+        r"common area maintenance fee is ฿[\d,]+(?:\.\d+)? per square meter.*?"
+        r"and is ฿(?P<amount>[\d,]+(?:\.\d+)?) for this",
+        r"CAM Fee.*?฿(?P<amount>[\d,]+(?:\.\d+)?)/mo",
+        r"CAM Fee.*?฿(?P<amount>[\d,]+(?:\.\d+)?)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            amount = parse_price_number(match.group("amount"))
+
+            if amount is not None:
+                return format_thb_monthly(amount)
+
+    return None
 
 
 def normalize_detail_prices_to_thb(
     values: Dict[str, Optional[str]],
     thb_data: Dict[str, Optional[float]],
-    rate_to_thb: Optional[float],
+    direct_thb_values: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Optional[str]]:
-    normalized: Dict[str, Optional[str]] = {}
-
-    for key, value in values.items():
-        if isinstance(value, str):
-            normalized[key] = convert_uah_text_to_thb(value, rate_to_thb)
-        else:
-            normalized[key] = value
+    normalized: Dict[str, Optional[str]] = dict(values)
+    direct_thb_values = direct_thb_values or {}
 
     current_price = thb_data.get("current_price")
     indoor_area = thb_data.get("indoor_area")
@@ -288,6 +341,11 @@ def normalize_detail_prices_to_thb(
     if current_price:
         normalized["unit_detail_price"] = format_thb(current_price)
         normalized["unit_detail_price_currency"] = "THB"
+
+    normalized["unit_detail_title"] = replace_title_price_with_thb(
+        normalized.get("unit_detail_title"),
+        normalized.get("unit_detail_price"),
+    )
 
     price_per_sqm = format_thb_per_sqm(current_price, indoor_area)
 
@@ -304,6 +362,22 @@ def normalize_detail_prices_to_thb(
             basic_information,
         )
         normalized["unit_basic_information"] = basic_information
+
+    cam_fee = direct_thb_values.get("unit_basic_cam_fee")
+
+    if cam_fee:
+        normalized["unit_basic_cam_fee"] = cam_fee
+        basic_information = normalized.get("unit_basic_information")
+
+        if basic_information:
+            basic_information = re.sub(
+                r"CAM Fee: [^|]+",
+                f"CAM Fee: {cam_fee} ",
+                basic_information,
+            )
+            normalized["unit_basic_information"] = basic_information
+
+    normalized = remove_non_thb_money_values(normalized)
 
     return normalized
 
@@ -534,20 +608,11 @@ def parse_unit_detail_page(unit_url: str) -> Dict[str, Optional[str]]:
             unit_id,
         )
 
-    rate_to_thb = get_page_currency_rate_to_thb(
-        soup,
-        thb_data.get("current_price"),
-    )
-
-    if thb_data.get("current_price") and not rate_to_thb:
-        logger.warning(
-            "Currency rate to THB was not detected from page title/meta | unit_url=%s | unit_id=%s",
-            unit_url,
-            unit_id,
-        )
-
     canonical_tag = soup.select_one('link[rel="canonical"]')
     h1_tag = soup.find("h1")
+    direct_thb_values = {
+        "unit_basic_cam_fee": parse_direct_thb_cam_fee(soup),
+    }
 
     result: Dict[str, Optional[str]] = {
         "unit_id": unit_id,
@@ -588,7 +653,11 @@ def parse_unit_detail_page(unit_url: str) -> Dict[str, Optional[str]]:
     result.update(parse_label_value_blocks(soup))
     result.update(parse_basic_information_items(soup))
     result.update(parse_amenities(soup))
-    result = normalize_detail_prices_to_thb(result, thb_data, rate_to_thb)
+    result = normalize_detail_prices_to_thb(
+        result,
+        thb_data,
+        direct_thb_values,
+    )
     result = {key: value for key, value in result.items() if value}
 
     log_missing_unit_fields(
