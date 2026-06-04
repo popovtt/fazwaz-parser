@@ -876,6 +876,31 @@ def parse_area_with_unit_pages(
     return rows
 
 
+def is_property_search_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+
+    path = urlparse(url).path
+    return "/property-for-sale/" in path or "/property-sales/" in path
+
+
+def parse_property_search_with_unit_pages(
+    start_url: str,
+    page_limit: Optional[int] = None,
+    listing_limit: Optional[int] = None,
+    detail_limit: Optional[int] = None,
+) -> List[Dict]:
+    from fazwaz_property_units import parse_property_search
+
+    return parse_property_search(
+        start_url,
+        page_limit=page_limit,
+        listing_limit=listing_limit,
+        parse_details_enabled=True,
+        detail_limit=detail_limit,
+    )
+
+
 def build_fieldnames(rows: List[Dict]) -> List[str]:
     fieldnames: Set[str] = set()
 
@@ -883,6 +908,12 @@ def build_fieldnames(rows: List[Dict]) -> List[str]:
         fieldnames.update(row.keys())
 
     preferred_fields = PROJECT_FIELDS + UNIT_FIELDS + DETAIL_FIELDS
+
+    if any(field.startswith("listing_") for field in fieldnames):
+        from fazwaz_property_units import LISTING_FIELDS
+
+        preferred_fields = PROJECT_FIELDS + LISTING_FIELDS + UNIT_FIELDS + DETAIL_FIELDS
+
     dynamic_fields = sorted(
         field for field in fieldnames
         if field not in preferred_fields
@@ -951,7 +982,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        help="Parse only the first N units from the project page.",
+        help=(
+            "Parse only the first N units from a project page. For property "
+            "search URLs, this also limits collected listings."
+        ),
+    )
+    parser.add_argument(
+        "--listing-limit",
+        type=int,
+        help="Collect only the first N listings from a property search URL.",
+    )
+    parser.add_argument(
+        "--detail-limit",
+        type=int,
+        help="Open detail pages only for the first N listings from a property search URL.",
     )
     parser.add_argument(
         "--project-limit",
@@ -997,6 +1041,15 @@ def main() -> None:
             page_limit=args.page_limit,
         )
         output_file = args.output or default_area_output_name(args.area)
+    elif is_property_search_url(args.project_url):
+        print(f"Property search: {args.project_url}")
+        rows = parse_property_search_with_unit_pages(
+            args.project_url,
+            page_limit=args.page_limit,
+            listing_limit=args.listing_limit or args.limit,
+            detail_limit=args.detail_limit,
+        )
+        output_file = args.output or default_output_name(args.project_url, rows)
     else:
         print(f"Project: {args.project_url}")
         rows = parse_project_with_unit_pages(args.project_url, args.limit)

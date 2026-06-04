@@ -1,5 +1,6 @@
 import csv
 import html
+import os
 import random
 import re
 import time
@@ -40,11 +41,41 @@ HEADERS = {
     "Referer": f"{BASE_URL}/{AREA}",
 }
 
+TARGET_CURRENCY = "THB"
+
+
+def parse_cookie_header(value: Optional[str]) -> Dict[str, str]:
+    cookies: Dict[str, str] = {}
+
+    for part in (value or "").split(";"):
+        if "=" not in part:
+            continue
+
+        key, cookie_value = part.split("=", 1)
+        key = key.strip()
+
+        if key:
+            cookies[key] = cookie_value.strip()
+
+    return cookies
+
+
 COOKIES = {
-    "currency": "THB",
+    "currency": TARGET_CURRENCY,
+    **parse_cookie_header(os.getenv("FAZWAZ_COOKIES")),
 }
 
-MIN_DELAY = 0.8
+PROXY_URL = os.getenv("FAZWAZ_PROXY")
+PROXIES = (
+    {
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    }
+    if PROXY_URL
+    else None
+)
+
+MIN_DELAY = 0.8 # Увеличить задержку
 MAX_DELAY = 1.7
 
 MAX_RETRIES = 5
@@ -106,8 +137,8 @@ def extract_unit_id(unit_url: Optional[str]) -> Optional[str]:
     if not unit_url:
         return None
 
-    match = re.search(r"-u(\d+)(?:\D|$)", unit_url)
-    return match.group(1) if match else None
+    matches = re.findall(r"-u(\d+)(?:\D|$)", unit_url)
+    return matches[-1] if matches else None
 
 
 def parse_embedded_unit_prices(page_html: str) -> Dict[str, Dict[str, str]]:
@@ -117,6 +148,7 @@ def parse_embedded_unit_prices(page_html: str) -> Dict[str, Dict[str, str]]:
     pattern = re.compile(
         r'"_index":"unit_index_v3".*?'
         r'"_id":"(?P<unit_id>\d+)".*?'
+        r'"abbr":"THB".*?'
         r'"current_price":"(?P<price>[\d.]+)".*?'
         r'"indoor_area":(?P<area>[\d.]+|null)',
         re.DOTALL,
@@ -146,6 +178,7 @@ def request_with_retry(url: str) -> Optional[requests.Response]:
                 url,
                 headers=HEADERS,
                 cookies=COOKIES,
+                proxies=PROXIES,
                 timeout=TIMEOUT
             )
 
